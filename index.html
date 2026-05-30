@@ -107,6 +107,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 // =====================================================
 // FHS TEAM TRACKER - SAM RUCKER
 // Multi-employee time tracking with PIN login
+// Updated: location now mandatory, no overlapping punches, fixed iOS time picker
 // =====================================================
 
 // ---------- TRANSLATIONS ----------
@@ -319,14 +320,33 @@ function getDayKey(ts) {
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
 async function getLocation() {
+  // Returns { ok:true, lat, lng } on success OR { ok:false, reason } on failure.
+  // reason is one of: 'no-api', 'denied', 'unavailable', 'timeout'
   return new Promise(res => {
-    if (!navigator.geolocation) return res(null);
+    if (!navigator.geolocation) return res({ ok: false, reason: 'no-api' });
     navigator.geolocation.getCurrentPosition(
-      p => res({ lat: p.coords.latitude.toFixed(5), lng: p.coords.longitude.toFixed(5) }),
-      () => res(null),
-      { timeout: 8000, enableHighAccuracy: false }
+      p => res({ ok: true, lat: p.coords.latitude.toFixed(5), lng: p.coords.longitude.toFixed(5) }),
+      err => {
+        let reason = 'unavailable';
+        if (err && err.code === 1) reason = 'denied';
+        else if (err && err.code === 3) reason = 'timeout';
+        res({ ok: false, reason });
+      },
+      { timeout: 12000, enableHighAccuracy: false, maximumAge: 0 }
     );
   });
+}
+function locationErrorMessage(reason) {
+  if (reason === 'denied') {
+    return "Location is required to clock in/out.\n\nYour phone has location turned OFF for this app.\n\nOn iPhone: Settings > Safari > Location > While Using the App. Then come back and try again.\n\nOn Android: Chrome > three-dot menu > Settings > Site settings > Location, then allow.";
+  }
+  if (reason === 'no-api') {
+    return "Your phone does not support location services. Ask Sam.";
+  }
+  if (reason === 'timeout') {
+    return "Could not get your location (timed out). Step outside or into a window and try again.";
+  }
+  return "Could not get your location. Make sure GPS is on and try again.";
 }
 
 // ---------- STATE ----------
@@ -360,6 +380,23 @@ function getCompletedPunches(empId) {
   return Store.data.punches
     .filter(p => p.empId === empId && p.clockOut)
     .sort((a,b) => b.clockIn - a.clockIn);
+}
+// Returns true if [inTs, outTs] overlaps any existing punch for this employee.
+// If outTs is null (open punch), we just check whether inTs falls inside any existing punch.
+// ignorePunchId lets us skip a punch we're editing.
+function hasOverlap(empId, inTs, outTs, ignorePunchId) {
+  return Store.data.punches.some(p => {
+    if (p.empId !== empId) return false;
+    if (ignorePunchId && p.id === ignorePunchId) return false;
+    const pIn = p.clockIn;
+    const pOut = p.clockOut == null ? Date.now() : p.clockOut; // treat open punches as ongoing-now
+    if (outTs == null) {
+      // We're starting a punch at inTs (e.g. clockIn now). Block if inTs falls inside an existing punch.
+      return inTs >= pIn && inTs <= pOut;
+    }
+    // Both ranges defined - standard interval overlap test
+    return inTs < pOut && outTs > pIn;
+  });
 }
 function getTodayMs(empId) {
   const start = getDayStart().getTime();
@@ -424,8 +461,19 @@ function getPriorPeriodStart(start) {
 
 // ---------- ACTIONS ----------
 async function clockIn(empId) {
+  const now = Date.now();
+  // Overlap guard: don't allow clocking in if 'now' falls inside an existing punch.
+  if (hasOverlap(empId, now, null)) {
+    alert("You already have a punch covering right now. You can't clock in on top of an existing punch. If you think this is wrong, talk to Sam.");
+    return;
+  }
+  // Location guard: mandatory
   const loc = await getLocation();
-  const p = { id: Date.now(), empId, clockIn: Date.now(), clockOut: null, startLoc: loc, endLoc: null };
+  if (!loc.ok) {
+    alert(locationErrorMessage(loc.reason));
+    return;
+  }
+  const p = { id: now, empId, clockIn: now, clockOut: null, startLoc: { lat: loc.lat, lng: loc.lng }, endLoc: null };
   Store.data.punches.push(p);
   Store.api.insertPunch(p);
   render();
@@ -434,8 +482,12 @@ async function clockOut(empId) {
   const punch = getOpenPunch(empId);
   if (!punch) return;
   const loc = await getLocation();
+  if (!loc.ok) {
+    alert(locationErrorMessage(loc.reason));
+    return;
+  }
   punch.clockOut = Date.now();
-  punch.endLoc = loc;
+  punch.endLoc = { lat: loc.lat, lng: loc.lng };
   Store.api.updatePunch(punch.id, { empId: punch.empId, clockIn: punch.clockIn, clockOut: punch.clockOut, startLoc: punch.startLoc, endLoc: punch.endLoc, fixApplied: punch.fixApplied, addedManually: punch.addedManually });
   render();
 }
@@ -478,6 +530,11 @@ function submitMissed(empId, clockInTs, clockOutTs, note) {
 function approveMissed(reqId) {
   const req = Store.data.missedRequests.find(r => r.id === reqId);
   if (!req) return;
+  if (hasOverlap(req.empId, req.clockIn, req.clockOut)) {
+    if (!confirm("This missed punch overlaps an existing punch for the same employee. Approving it will create a duplicate. Approve anyway?")) {
+      return;
+    }
+  }
   const p = { id: Date.now(), empId: req.empId, clockIn: req.clockIn, clockOut: req.clockOut, startLoc: null, endLoc: null, addedManually: true };
   Store.data.punches.push(p);
   Store.api.insertPunch(p);
@@ -495,6 +552,10 @@ function rejectMissed(reqId) {
 function editPunch(punchId, newIn, newOut) {
   const p = Store.data.punches.find(x => x.id === punchId);
   if (!p) return;
+  if (hasOverlap(p.empId, newIn, newOut, punchId)) {
+    alert("That time overlaps another punch on the same day. Pick different times.");
+    return;
+  }
   p.clockIn = newIn;
   p.clockOut = newOut;
   p.fixApplied = true;
@@ -769,19 +830,31 @@ function renderMissedModal() {
     const iso = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
     dateOpts.push({ value: iso, label: fmtDate(d) });
   }
+  // 12-hour clock dropdowns — much more reliable than <input type=time> on iOS
+  const hourOpts  = (sel) => Array.from({length:12}, (_,i) => { const v = i+1; return `<option value="${v}"${v===sel?' selected':''}>${v}</option>`; }).join('');
+  const minOpts   = (sel) => Array.from({length:12}, (_,i) => { const v = i*5; return `<option value="${v}"${v===sel?' selected':''}>${String(v).padStart(2,'0')}</option>`; }).join('');
+  const ampmOpts  = (sel) => ['AM','PM'].map(v => `<option value="${v}"${v===sel?' selected':''}>${v}</option>`).join('');
   return `
     <div style="position:fixed;inset:0;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;z-index:100;padding:16px">
       <div class="card" style="margin:0;max-width:380px;width:100%;max-height:90vh;overflow-y:auto">
         <div class="h2">${t.addMissedPunch}</div>
         <div class="sub">${t.missedPunchDesc}</div>
         <label class="label">${t.pickDate}</label>
-        <select class="inp" id="m-date" style="margin-bottom:12px">
+        <select class="inp" id="m-date" style="margin-bottom:14px">
           ${dateOpts.map(o => `<option value="${o.value}">${o.label}</option>`).join('')}
         </select>
         <label class="label">${t.clockInTime}</label>
-        <input type="time" class="inp" id="m-in" value="07:00" style="margin-bottom:12px">
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:14px">
+          <select class="inp" id="m-in-h"  style="font-size:18px;padding:14px 8px">${hourOpts(7)}</select>
+          <select class="inp" id="m-in-m"  style="font-size:18px;padding:14px 8px">${minOpts(0)}</select>
+          <select class="inp" id="m-in-ap" style="font-size:18px;padding:14px 8px">${ampmOpts('AM')}</select>
+        </div>
         <label class="label">${t.clockOutTime}</label>
-        <input type="time" class="inp" id="m-out" value="16:00" style="margin-bottom:12px">
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-bottom:14px">
+          <select class="inp" id="m-out-h"  style="font-size:18px;padding:14px 8px">${hourOpts(4)}</select>
+          <select class="inp" id="m-out-m"  style="font-size:18px;padding:14px 8px">${minOpts(0)}</select>
+          <select class="inp" id="m-out-ap" style="font-size:18px;padding:14px 8px">${ampmOpts('PM')}</select>
+        </div>
         <label class="label">${t.requestNote}</label>
         <textarea class="inp" id="m-note" rows="3" style="margin-bottom:12px"></textarea>
         <button class="btn btn-blue" onclick="submitMissedForm()">${t.submit}</button>
@@ -827,20 +900,29 @@ window.closeMissed = function() {
 window.submitMissedForm = function() {
   const t = T[getCurrentLang()];
   const dateStr = document.getElementById('m-date').value;
-  const inStr = document.getElementById('m-in').value;
-  const outStr = document.getElementById('m-out').value;
+  const inH  = parseInt(document.getElementById('m-in-h').value, 10);
+  const inM  = parseInt(document.getElementById('m-in-m').value, 10);
+  const inAP = document.getElementById('m-in-ap').value;
+  const outH  = parseInt(document.getElementById('m-out-h').value, 10);
+  const outM  = parseInt(document.getElementById('m-out-m').value, 10);
+  const outAP = document.getElementById('m-out-ap').value;
   const note = document.getElementById('m-note').value;
-  if (!dateStr || !inStr || !outStr) {
-    alert('Please fill in date, clock-in, and clock-out');
+  if (!dateStr) {
+    alert('Please pick a date');
     return;
   }
+  function to24(h, ap) { if (ap === 'AM') return h === 12 ? 0 : h; return h === 12 ? 12 : h + 12; }
+  const ih = to24(inH, inAP);
+  const oh = to24(outH, outAP);
   const [y, mo, da] = dateStr.split('-').map(Number);
-  const [ih, im] = inStr.split(':').map(Number);
-  const [oh, om] = outStr.split(':').map(Number);
-  const inTs = new Date(y, mo-1, da, ih, im).getTime();
-  const outTs = new Date(y, mo-1, da, oh, om).getTime();
+  const inTs = new Date(y, mo-1, da, ih, inM).getTime();
+  const outTs = new Date(y, mo-1, da, oh, outM).getTime();
   if (outTs <= inTs) {
     alert(t.invalidTimes);
+    return;
+  }
+  if (hasOverlap(state.currentEmpId, inTs, outTs)) {
+    alert("That time overlaps a punch you already have on that day. Pick different times, or talk to Sam if you think your existing punch is wrong.");
     return;
   }
   submitMissed(state.currentEmpId, inTs, outTs, note);
